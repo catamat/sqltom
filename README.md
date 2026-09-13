@@ -19,7 +19,7 @@ manifest, and renders Go packages from that manifest.
 sqltom requires Go 1.27 or newer. Install the latest version with:
 
 ```sh
-go install github.com/catamat/sqltom@latest
+go install github.com/catamat/sqltom/cmd/sqltom@latest
 ```
 
 Then verify the installation:
