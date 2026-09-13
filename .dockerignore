@@ -1,0 +1,6 @@
+.git
+.vscode
+.DS_Store
+**/.DS_Store
+models
+sqltom_*.json
