@@ -3,6 +3,7 @@ package render
 import (
 	"bytes"
 	"context"
+	"embed"
 	"fmt"
 	"go/format"
 	"io/fs"
@@ -17,17 +18,36 @@ import (
 	"github.com/catamat/sqltom/internal/output"
 )
 
+const defaultTemplateName = "model.go.tpl"
+
+//go:embed model.go.tpl
+var defaultTemplateFS embed.FS
+
 type Config struct {
-	Dialect            string
-	TemplateFS         fs.FS
-	TemplateName       string
-	SQLIdentifier      func(string) string
-	SQLTableIdentifier func(catalog, schema, name string) string
+	Dialect              string
+	TemplateFS           fs.FS
+	TemplateName         string
+	SQLIdentifier        func(string) string
+	SQLTableIdentifier   func(catalog, schema, name string) string
+	Placeholder          func(index int) string
+	InsertStrategy       InsertStrategy
+	EmptyInsert          string
+	UnsignedLastInsertID bool
+	RejectNullUpdateKey  bool
+	TypeDefaults         map[string]manifest.TypeMapping
+	ScanSQLServerUUID    bool
+	TypedBinaryNulls     bool
+	ScanBinary           bool
 }
 
 func Render(ctx context.Context, m *manifest.Manifest, outputFolder string, config Config) error {
+	config = config.withDefaults()
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	m, err := manifest.WithTypeDefaults(m, config.TypeDefaults)
+	if err != nil {
+		return fmt.Errorf("resolve %s type defaults: %w", config.Dialect, err)
 	}
 	if err := Validate(m); err != nil {
 		return fmt.Errorf("validate manifest for rendering: %w", err)
@@ -38,6 +58,9 @@ func Render(ctx context.Context, m *manifest.Manifest, outputFolder string, conf
 	}
 
 	return output.Build(ctx, outputFolder, func(ctx context.Context, stagingDir string) error {
+		if err := renderQueryPackage(ctx, stagingDir, config); err != nil {
+			return fmt.Errorf("render query support package: %w", err)
+		}
 		for _, table := range m.Tables {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -46,6 +69,7 @@ func Render(ctx context.Context, m *manifest.Manifest, outputFolder string, conf
 			if err != nil {
 				return fmt.Errorf("prepare table %q: %w", table.Key(), err)
 			}
+			data.configureRuntime(config)
 			if err := renderTable(tpl, config.TemplateName, stagingDir, data); err != nil {
 				return fmt.Errorf("render table %q: %w", table.Key(), err)
 			}
@@ -55,12 +79,14 @@ func Render(ctx context.Context, m *manifest.Manifest, outputFolder string, conf
 }
 
 func parseTemplate(config Config) (*template.Template, error) {
+	config = config.withDefaults()
 	functions := template.FuncMap{
 		"add": func(x, y int) int { return x + y },
 		"last": func(index int, value any) bool {
 			return index == reflect.ValueOf(value).Len()-1
 		},
 		"quote":              strconv.Quote,
+		"placeholder":        config.Placeholder,
 		"sqlIdentifier":      config.SQLIdentifier,
 		"sqlTableIdentifier": config.SQLTableIdentifier,
 		"structTag": func(databaseName, jsonName string, includeJSON bool) string {
@@ -79,6 +105,22 @@ func parseTemplate(config Config) (*template.Template, error) {
 		return nil, fmt.Errorf("parse %s template: %w", config.Dialect, err)
 	}
 	return tpl, nil
+}
+
+func (config Config) withDefaults() Config {
+	if config.TemplateFS == nil {
+		config.TemplateFS = defaultTemplateFS
+	}
+	if config.TemplateName == "" {
+		config.TemplateName = defaultTemplateName
+	}
+	if config.Placeholder == nil {
+		config.Placeholder = func(int) string { return "?" }
+	}
+	if config.EmptyInsert == "" {
+		config.EmptyInsert = "DEFAULT VALUES"
+	}
+	return config
 }
 
 func renderTable(tpl *template.Template, templateName, staging string, data Data) error {

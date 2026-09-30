@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -87,13 +88,14 @@ func TestInspectRejectsInvalidPostgreSQLCatalogResults(t *testing.T) {
 }
 
 func postgresResponse(rows [][]driver.Value) testdb.Response {
+	rows = testdb.WithPrimaryKeyCounts(rows)
 	return testdb.Response{
 		ExpectedQuery: catalogQuery,
 		Columns: []string{
 			"database_name", "server_version", "table_catalog", "table_schema", "table_name", "table_type",
 			"column_name", "ordinal_position", "is_nullable", "data_type", "udt_schema", "udt_name",
 			"domain_schema", "domain_name", "is_identity", "is_primary_key", "is_computed",
-			"is_generated_always", "has_default", "primary_key_ordinal",
+			"is_generated_always", "has_default", "primary_key_ordinal", "primary_key_count",
 		},
 		Rows: rows,
 	}
@@ -158,11 +160,32 @@ func TestCatalogQueryCapturesPostgreSQLMetadata(t *testing.T) {
 		"column_info.is_generated <> 'NEVER'",
 		"column_info.domain_schema",
 		"column_info.domain_name",
-		"constraint_info.constraint_type = 'PRIMARY KEY'",
+		"index_info.indisprimary",
+		"key_info.ordinal_position <= index_info.indnkeyatts",
+		"pg_catalog.pg_attribute",
 		"table_info.table_schema NOT IN ('information_schema', 'pg_catalog')",
 	} {
 		if !strings.Contains(catalogQuery, fragment) {
 			t.Errorf("catalogQuery does not contain %q", fragment)
 		}
+	}
+}
+
+func TestInspectRejectsIncompletePrimaryKey(t *testing.T) {
+	for _, hidden := range []bool{false, true} {
+		t.Run(fmt.Sprintf("entire_key_hidden=%v", hidden), func(t *testing.T) {
+			row := postgresCatalogRow("MainDB", "public", "Vehicle", "BASE TABLE", "ID", 1, false, "integer", "pg_catalog", "int4", nil, nil, false, true, false, false, false, 1)
+			if hidden {
+				row[15] = false
+				row[len(row)-1] = int64(0)
+			}
+			response := postgresResponse([][]driver.Value{row})
+			response.Rows[0][len(row)] = int64(2)
+			fakePostgresDriver.SetResponse(response)
+			inspection, err := (&Backend{driverName: fakePostgresDriverName}).Inspect(context.Background(), "dsn")
+			if inspection != nil || err == nil || !strings.Contains(err.Error(), "incomplete primary key metadata") {
+				t.Fatalf("Inspect = %#v, %v; want incomplete-key error", inspection, err)
+			}
+		})
 	}
 }

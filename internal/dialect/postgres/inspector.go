@@ -32,7 +32,8 @@ SELECT
     catalog_info.is_computed,
     catalog_info.is_generated_always,
     catalog_info.has_default,
-    catalog_info.primary_key_ordinal
+    catalog_info.primary_key_ordinal,
+    catalog_info.primary_key_count
 FROM (
     SELECT
         current_database()::text AS database_name,
@@ -63,7 +64,16 @@ LEFT JOIN (
             column_info.column_default IS NOT NULL
             OR domain_info.domain_default IS NOT NULL
         ) AS has_default,
-        COALESCE(primary_key.ordinal_position, 0) AS primary_key_ordinal
+        COALESCE(primary_key.ordinal_position, 0) AS primary_key_ordinal,
+        COALESCE((
+            SELECT index_info.indnkeyatts
+            FROM pg_catalog.pg_index AS index_info
+            INNER JOIN pg_catalog.pg_class AS relation_info ON relation_info.oid = index_info.indrelid
+            INNER JOIN pg_catalog.pg_namespace AS namespace_info ON namespace_info.oid = relation_info.relnamespace
+            WHERE index_info.indisprimary
+                AND namespace_info.nspname = column_info.table_schema
+                AND relation_info.relname = column_info.table_name
+        ), 0) AS primary_key_count
     FROM information_schema.tables AS table_info
     INNER JOIN information_schema.columns AS column_info
         ON column_info.table_catalog = table_info.table_catalog
@@ -71,20 +81,23 @@ LEFT JOIN (
         AND column_info.table_name = table_info.table_name
     LEFT JOIN (
         SELECT
-            constraint_info.table_catalog,
-            constraint_info.table_schema,
-            constraint_info.table_name,
-            key_info.column_name,
+            current_database()::text AS table_catalog,
+            schema_info.nspname AS table_schema,
+            table_info.relname AS table_name,
+            attribute_info.attname AS column_name,
             key_info.ordinal_position
-        FROM information_schema.table_constraints AS constraint_info
-        INNER JOIN information_schema.key_column_usage AS key_info
-            ON key_info.constraint_catalog = constraint_info.constraint_catalog
-            AND key_info.constraint_schema = constraint_info.constraint_schema
-            AND key_info.constraint_name = constraint_info.constraint_name
-            AND key_info.table_catalog = constraint_info.table_catalog
-            AND key_info.table_schema = constraint_info.table_schema
-            AND key_info.table_name = constraint_info.table_name
-        WHERE constraint_info.constraint_type = 'PRIMARY KEY'
+        FROM pg_catalog.pg_index AS index_info
+        INNER JOIN pg_catalog.pg_class AS table_info
+            ON table_info.oid = index_info.indrelid
+        INNER JOIN pg_catalog.pg_namespace AS schema_info
+            ON schema_info.oid = table_info.relnamespace
+        CROSS JOIN LATERAL unnest(index_info.indkey) WITH ORDINALITY
+            AS key_info(attribute_number, ordinal_position)
+        INNER JOIN pg_catalog.pg_attribute AS attribute_info
+            ON attribute_info.attrelid = table_info.oid
+            AND attribute_info.attnum = key_info.attribute_number
+        WHERE index_info.indisprimary
+            AND key_info.ordinal_position <= index_info.indnkeyatts
     ) AS primary_key
         ON primary_key.table_catalog = column_info.table_catalog
         AND primary_key.table_schema = column_info.table_schema
@@ -144,12 +157,13 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 	var serverVersion string
 	databaseNameSeen := false
 	tables := map[manifest.TableKey]*manifest.Table{}
+	primaryKeys := dialect.PrimaryKeyCounts{}
 	for rows.Next() {
 		var rowDatabaseName, rowServerVersion string
 		var tableCatalog, tableSchema, tableName, tableType sql.NullString
 		var columnName, dataType, udtSchema, udtName sql.NullString
 		var domainSchema, domainName sql.NullString
-		var ordinalPosition, primaryKeyOrdinal sql.NullInt64
+		var ordinalPosition, primaryKeyOrdinal, primaryKeyCount sql.NullInt64
 		var isNullable, isIdentity, isPrimaryKey sql.NullBool
 		var isComputed, isGeneratedAlways, hasDefault sql.NullBool
 		if err := rows.Scan(
@@ -173,6 +187,7 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 			&isGeneratedAlways,
 			&hasDefault,
 			&primaryKeyOrdinal,
+			&primaryKeyCount,
 		); err != nil {
 			return nil, fmt.Errorf("scan PostgreSQL catalog: %w", err)
 		}
@@ -195,7 +210,7 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 			columnName.Valid, ordinalPosition.Valid, isNullable.Valid, dataType.Valid,
 			udtSchema.Valid, udtName.Valid, isIdentity.Valid, isPrimaryKey.Valid,
 			isComputed.Valid, isGeneratedAlways.Valid, hasDefault.Valid,
-			primaryKeyOrdinal.Valid,
+			primaryKeyOrdinal.Valid, primaryKeyCount.Valid,
 		}
 		validCount := 0
 		for _, valid := range valuesValid {
@@ -218,6 +233,9 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 		}
 
 		key := manifest.TableKey{Catalog: tableCatalog.String, Schema: tableSchema.String, Name: tableName.String}
+		if err := primaryKeys.Observe(key, primaryKeyCount.Int64); err != nil {
+			return nil, fmt.Errorf("validate PostgreSQL inspection: %w", err)
+		}
 		table, exists := tables[key]
 		if !exists {
 			table = &manifest.Table{
@@ -253,6 +271,9 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 
 	result := make([]manifest.Table, 0, len(tables))
 	for _, table := range tables {
+		if err := primaryKeys.Validate(*table); err != nil {
+			return nil, fmt.Errorf("validate PostgreSQL inspection: %w", err)
+		}
 		result = append(result, *table)
 	}
 	document := manifest.New(databaseName, result)

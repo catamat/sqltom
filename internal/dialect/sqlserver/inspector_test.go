@@ -2,184 +2,120 @@ package sqlserver
 
 import (
 	"context"
-	"database/sql"
 	"database/sql/driver"
 	"errors"
-	"io"
+	"fmt"
 	"strings"
-	"sync"
 	"testing"
 
+	"github.com/catamat/sqltom/internal/dialect/testdb"
 	"github.com/catamat/sqltom/internal/manifest"
 )
 
 const fakeDriverName = "sqltom-sqlserver-test"
 
-var registeredFakeDriver = &fakeDriver{}
-
-func init() {
-	sql.Register(fakeDriverName, registeredFakeDriver)
-}
+var registeredFakeDriver = testdb.Register(fakeDriverName)
 
 func TestInspectBuildsManifestFromOneCatalogQuery(t *testing.T) {
-	registeredFakeDriver.reset()
-	t.Cleanup(registeredFakeDriver.reset)
-
+	registeredFakeDriver.SetResponse(sqlserverResponse([][]driver.Value{
+		catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "RecordID", 1, false, "int", true, true, false, false, false, false, 1),
+		catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "Total", 2, true, "[moneytypes].[Amount]", false, false, false, false, false, true, 0),
+		catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "Stamp", 3, false, "timestamp", false, false, false, false, true, false, 0),
+		catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "PeriodStart", 4, false, "datetime2", false, false, false, true, false, false, 0),
+		catalogRow("MainDB", "audit", "Vehicle", "VIEW", "RecordID", 1, false, "int", false, false, true, false, false, false, 0),
+	}))
 	inspection, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "opaque-dsn")
 	if err != nil {
-		t.Fatalf("Inspect() error = %v", err)
+		t.Fatal(err)
 	}
-	if got := registeredFakeDriver.openedDSN(); got != "opaque-dsn" {
-		t.Fatalf("driver DSN = %q, want opaque-dsn", got)
+	if registeredFakeDriver.DSN() != "opaque-dsn" || registeredFakeDriver.Queries() != 1 {
+		t.Fatalf("driver state = dsn %q, queries %d", registeredFakeDriver.DSN(), registeredFakeDriver.Queries())
 	}
-	if inspection.DatabaseName != "MainDB" || inspection.Manifest.DatabaseName != "MainDB" {
-		t.Fatalf("database identity = inspection %q, manifest %q", inspection.DatabaseName, inspection.Manifest.DatabaseName)
-	}
-	if len(inspection.Manifest.Tables) != 2 {
-		t.Fatalf("len(Tables) = %d, want 2", len(inspection.Manifest.Tables))
+	if inspection.DatabaseName != "MainDB" || inspection.Manifest.DatabaseName != "MainDB" || len(inspection.Manifest.Tables) != 2 {
+		t.Fatalf("inspection = %#v", inspection)
 	}
 	for _, table := range inspection.Manifest.Tables {
 		if !table.IsManaged {
-			t.Fatalf("inspected table is not managed by default: %#v", table)
+			t.Fatalf("unmanaged table: %#v", table)
 		}
 	}
-
-	auditView := inspection.Manifest.Tables[0]
-	if auditView.TableCatalog != "MainDB" || auditView.TableSchema != "audit" || auditView.TableName != "Vehicle" || auditView.TableType != "VIEW" {
-		t.Fatalf("audit view identity = %#v", auditView)
+	view, table := inspection.Manifest.Tables[0], inspection.Manifest.Tables[1]
+	if view.TableCatalog != "MainDB" || view.TableSchema != "audit" || view.TableName != "Vehicle" || view.TableType != "VIEW" {
+		t.Fatalf("view = %#v", view)
 	}
-
-	table := inspection.Manifest.Tables[1]
-	if table.TableCatalog != "MainDB" || table.TableSchema != "dbo" || table.TableName != "Vehicle" || table.TableType != "BASE TABLE" {
-		t.Fatalf("base table identity = %#v", table)
+	if table.TableCatalog != "MainDB" || table.TableSchema != "dbo" || table.TableName != "Vehicle" || table.TableType != "BASE TABLE" || len(table.Columns) != 4 {
+		t.Fatalf("table = %#v", table)
 	}
-	if len(table.Columns) != 4 {
-		t.Fatalf("len(base table Columns) = %d, want 4", len(table.Columns))
+	if c := table.Columns[0]; c.ColumnName != "RecordID" || c.DataType != manifest.DataTypeInteger || !c.IsIdentity || !c.IsPrimaryKey || c.PrimaryKeyOrdinal != 1 || c.IsNullable {
+		t.Fatalf("primary key = %#v", c)
 	}
-	primaryKey := table.Columns[0]
-	if primaryKey.ColumnName != "FW_ID" || primaryKey.DataType != "uuid" || !primaryKey.IsIdentity || !primaryKey.IsPrimaryKey || primaryKey.PrimaryKeyOrdinal != 1 || primaryKey.IsNullable {
-		t.Fatalf("primary-key metadata = %#v", primaryKey)
+	if c := table.Columns[1]; c.ColumnName != "Total" || c.DataType != "[moneytypes].[Amount]" || !c.IsNullable || !c.HasDefault {
+		t.Fatalf("UDT/default = %#v", c)
 	}
-	withTypeDefault := table.Columns[1]
-	if withTypeDefault.ColumnName != "Total" || withTypeDefault.DataType != "[moneytypes].[Amount]" || !withTypeDefault.IsNullable || !withTypeDefault.HasDefault {
-		t.Fatalf("UDT/default metadata = %#v", withTypeDefault)
+	if c := table.Columns[2]; c.DataType != manifest.DataTypeRowVersion || !c.IsRowVersion || c.IsComputed || c.IsGeneratedAlways {
+		t.Fatalf("rowversion = %#v", c)
 	}
-	rowVersion := table.Columns[2]
-	if rowVersion.ColumnName != "Stamp" || rowVersion.DataType != "rowversion" || !rowVersion.IsRowVersion || rowVersion.IsComputed || rowVersion.IsGeneratedAlways {
-		t.Fatalf("row-version metadata = %#v", rowVersion)
-	}
-	generatedAlways := table.Columns[3]
-	if generatedAlways.ColumnName != "PeriodStart" || generatedAlways.DataType != "datetime" || generatedAlways.IsComputed || !generatedAlways.IsGeneratedAlways {
-		t.Fatalf("generated-always metadata = %#v", generatedAlways)
-	}
-
-	state := registeredFakeDriver.callState()
-	if state.queries != 1 || state.begins != 0 {
-		t.Fatalf("database calls = %#v, want one query and no transaction", state)
+	if c := table.Columns[3]; c.DataType != manifest.DataTypeDateTime || c.IsComputed || !c.IsGeneratedAlways {
+		t.Fatalf("generated column = %#v", c)
 	}
 }
 
 func TestInspectReturnsDatabaseIdentityForEmptyVisibleCatalog(t *testing.T) {
-	registeredFakeDriver.reset()
-	registeredFakeDriver.emptyCatalog = true
-	t.Cleanup(registeredFakeDriver.reset)
-
-	inspection, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "opaque-dsn")
+	row := make([]driver.Value, 18)
+	row[0], row[1] = "MainDB", "16.0.1000.6"
+	registeredFakeDriver.SetResponse(sqlserverResponse([][]driver.Value{row}))
+	inspection, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "dsn")
 	if err != nil {
-		t.Fatalf("Inspect() error = %v", err)
+		t.Fatal(err)
 	}
-	if inspection.DatabaseName != "MainDB" || inspection.Manifest.DatabaseName != "MainDB" {
-		t.Fatalf("database identity = inspection %q, manifest %q", inspection.DatabaseName, inspection.Manifest.DatabaseName)
-	}
-	if len(inspection.Manifest.Tables) != 0 {
-		t.Fatalf("len(Tables) = %d, want 0", len(inspection.Manifest.Tables))
-	}
-	state := registeredFakeDriver.callState()
-	if state.queries != 1 || state.begins != 0 {
-		t.Fatalf("database calls = %#v, want one query and no transaction", state)
+	if inspection.DatabaseName != "MainDB" || len(inspection.Manifest.Tables) != 0 || registeredFakeDriver.Queries() != 1 {
+		t.Fatalf("inspection = %#v", inspection)
 	}
 }
 
-func TestInspectRejectsExternalTablesDefensively(t *testing.T) {
-	registeredFakeDriver.reset()
-	registeredFakeDriver.externalTable = true
-	t.Cleanup(registeredFakeDriver.reset)
-
-	_, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "opaque-dsn")
-	if err == nil || !strings.Contains(err.Error(), `unsupported table type "EXTERNAL TABLE"`) {
-		t.Fatalf("Inspect() error = %v", err)
+func TestInspectRejectsInvalidSQLServerCatalogResults(t *testing.T) {
+	valid := catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "ID", 1, false, "int", true, true, false, false, false, false, 1)
+	with := func(index int, value driver.Value) []driver.Value {
+		row := append([]driver.Value(nil), valid...)
+		row[index] = value
+		return row
 	}
-	state := registeredFakeDriver.callState()
-	if state.queries != 1 || state.begins != 0 {
-		t.Fatalf("database calls = %#v, want one query and no transaction", state)
-	}
-}
-
-func TestInspectRejectsInconsistentDatabaseIdentity(t *testing.T) {
-	registeredFakeDriver.reset()
-	registeredFakeDriver.inconsistentDatabase = true
-	t.Cleanup(registeredFakeDriver.reset)
-
-	_, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "opaque-dsn")
-	if err == nil || !strings.Contains(err.Error(), `inconsistent database names "MainDB" and "OtherDB"`) {
-		t.Fatalf("Inspect() error = %v", err)
-	}
-}
-
-func TestInspectRejectsUnsupportedAndInconsistentSQLServerVersions(t *testing.T) {
+	iteration := sqlserverResponse([][]driver.Value{valid})
+	iteration.IterationError = errors.New("iteration failed")
 	tests := []struct {
-		name         string
-		configure    func(*fakeDriver)
-		wantContains string
+		name     string
+		response testdb.Response
+		message  string
 	}{
-		{name: "unsupported", configure: func(driver *fakeDriver) { driver.oldVersion = true }, wantContains: "minimum is 13.0"},
-		{name: "inconsistent", configure: func(driver *fakeDriver) { driver.inconsistentVersion = true }, wantContains: "inconsistent server versions"},
+		{"old version", sqlserverResponse([][]driver.Value{with(1, "12.0.6024.0")}), "minimum is 13.0"},
+		{"inconsistent version", sqlserverResponse([][]driver.Value{valid, with(1, "15.0.2000.5")}), "inconsistent server versions"},
+		{"inconsistent database", sqlserverResponse([][]driver.Value{valid, with(0, "OtherDB")}), "inconsistent database names"},
+		{"mismatched catalog", sqlserverResponse([][]driver.Value{with(2, "OtherDB")}), "does not match DatabaseName"},
+		{"incomplete metadata", sqlserverResponse([][]driver.Value{with(6, nil)}), "incomplete catalog metadata"},
+		{"unsupported object", sqlserverResponse([][]driver.Value{with(5, "EXTERNAL TABLE")}), "unsupported table type"},
+		{"scan error", sqlserverResponse([][]driver.Value{with(7, "invalid ordinal")}), "scan SQL Server catalog"},
+		{"ping error", testdb.Response{PingError: errors.New("ping failed")}, "connect to SQL Server"},
+		{"query error", testdb.Response{ExpectedQuery: catalogQuery, QueryError: errors.New("query failed")}, "query SQL Server catalog"},
+		{"iteration error", iteration, "iterate SQL Server catalog"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			registeredFakeDriver.reset()
-			test.configure(registeredFakeDriver)
-			t.Cleanup(registeredFakeDriver.reset)
-			_, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "opaque-dsn")
-			if err == nil || !strings.Contains(err.Error(), test.wantContains) {
-				t.Fatalf("Inspect() error = %v, want substring %q", err, test.wantContains)
+			registeredFakeDriver.SetResponse(test.response)
+			_, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "dsn")
+			if err == nil || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("Inspect() error = %v, want %q", err, test.message)
 			}
 		})
 	}
 }
 
-func TestInspectRejectsSQLServerOperationalErrors(t *testing.T) {
-	tests := []struct {
-		name         string
-		configure    func(*fakeDriver)
-		wantContains string
-	}{
-		{name: "ping", configure: func(driver *fakeDriver) { driver.pingError = errors.New("ping failed") }, wantContains: "connect to SQL Server"},
-		{name: "query", configure: func(driver *fakeDriver) { driver.queryError = errors.New("query failed") }, wantContains: "query SQL Server catalog"},
-		{name: "iteration", configure: func(driver *fakeDriver) { driver.iterationError = errors.New("iteration failed") }, wantContains: "iterate SQL Server catalog"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			registeredFakeDriver.reset()
-			test.configure(registeredFakeDriver)
-			t.Cleanup(registeredFakeDriver.reset)
-			_, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "opaque-dsn")
-			if err == nil || !strings.Contains(err.Error(), test.wantContains) {
-				t.Fatalf("Inspect() error = %v, want substring %q", err, test.wantContains)
-			}
-		})
-	}
-}
-
-func TestInspectRejectsTableCatalogDifferentFromDatabase(t *testing.T) {
-	registeredFakeDriver.reset()
-	registeredFakeDriver.mismatchedCatalog = true
-	t.Cleanup(registeredFakeDriver.reset)
-
-	_, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "opaque-dsn")
-	if err == nil || !strings.Contains(err.Error(), `TableCatalog "OtherDB" does not match DatabaseName "MainDB"`) {
-		t.Fatalf("Inspect() error = %v", err)
-	}
+func sqlserverResponse(rows [][]driver.Value) testdb.Response {
+	rows = testdb.WithPrimaryKeyCounts(rows)
+	return testdb.Response{ExpectedQuery: catalogQuery, Rows: rows, Columns: []string{
+		"DATABASE_NAME", "SERVER_VERSION", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE",
+		"COLUMN_NAME", "ORDINAL_POSITION", "IS_NULLABLE", "DATA_TYPE", "TYPE_PRECISION", "IS_IDENTITY",
+		"IS_PRIMARY_KEY", "IS_COMPUTED", "IS_GENERATED_ALWAYS", "IS_ROW_VERSION", "HAS_DEFAULT", "PRIMARY_KEY_ORDINAL", "PRIMARY_KEY_COUNT",
+	}}
 }
 
 func TestValidateInspectionManifestRequiresSQLServerSourceIdentity(t *testing.T) {
@@ -306,173 +242,6 @@ func TestCatalogQueryEnforcesSupportedSQLServerMetadata(t *testing.T) {
 	}
 }
 
-type databaseCallState struct {
-	queries int
-	begins  int
-}
-
-type fakeDriver struct {
-	mu                   sync.Mutex
-	dsn                  string
-	pingError            error
-	queryError           error
-	iterationError       error
-	emptyCatalog         bool
-	externalTable        bool
-	inconsistentDatabase bool
-	mismatchedCatalog    bool
-	oldVersion           bool
-	inconsistentVersion  bool
-	calls                databaseCallState
-}
-
-func (d *fakeDriver) Open(dsn string) (driver.Conn, error) {
-	d.mu.Lock()
-	d.dsn = dsn
-	pingError := d.pingError
-	queryError := d.queryError
-	iterationError := d.iterationError
-	emptyCatalog := d.emptyCatalog
-	externalTable := d.externalTable
-	inconsistentDatabase := d.inconsistentDatabase
-	mismatchedCatalog := d.mismatchedCatalog
-	oldVersion := d.oldVersion
-	inconsistentVersion := d.inconsistentVersion
-	d.mu.Unlock()
-	return &fakeConn{
-		driver:               d,
-		pingError:            pingError,
-		queryError:           queryError,
-		iterationError:       iterationError,
-		emptyCatalog:         emptyCatalog,
-		externalTable:        externalTable,
-		inconsistentDatabase: inconsistentDatabase,
-		mismatchedCatalog:    mismatchedCatalog,
-		oldVersion:           oldVersion,
-		inconsistentVersion:  inconsistentVersion,
-	}, nil
-}
-
-func (d *fakeDriver) reset() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.dsn = ""
-	d.pingError = nil
-	d.queryError = nil
-	d.iterationError = nil
-	d.emptyCatalog = false
-	d.externalTable = false
-	d.inconsistentDatabase = false
-	d.mismatchedCatalog = false
-	d.oldVersion = false
-	d.inconsistentVersion = false
-	d.calls = databaseCallState{}
-}
-
-func (d *fakeDriver) openedDSN() string {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.dsn
-}
-
-func (d *fakeDriver) recordQuery() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.calls.queries++
-}
-
-func (d *fakeDriver) recordBegin() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.calls.begins++
-}
-
-func (d *fakeDriver) callState() databaseCallState {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.calls
-}
-
-type fakeConn struct {
-	driver               *fakeDriver
-	pingError            error
-	queryError           error
-	iterationError       error
-	emptyCatalog         bool
-	externalTable        bool
-	inconsistentDatabase bool
-	mismatchedCatalog    bool
-	oldVersion           bool
-	inconsistentVersion  bool
-}
-
-func (c *fakeConn) Prepare(string) (driver.Stmt, error) {
-	return nil, errors.New("Prepare is not supported")
-}
-
-func (c *fakeConn) Close() error { return nil }
-
-func (c *fakeConn) Begin() (driver.Tx, error) {
-	c.driver.recordBegin()
-	return nil, errors.New("transactions are not supported")
-}
-
-func (c *fakeConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
-	c.driver.recordBegin()
-	return nil, errors.New("transactions are not supported")
-}
-
-func (c *fakeConn) Ping(context.Context) error { return c.pingError }
-
-func (c *fakeConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	c.driver.recordQuery()
-	if c.queryError != nil {
-		return nil, c.queryError
-	}
-	if query != catalogQuery {
-		return nil, errors.New("unexpected query")
-	}
-	columns := []string{
-		"DATABASE_NAME", "SERVER_VERSION", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE",
-		"COLUMN_NAME", "ORDINAL_POSITION", "IS_NULLABLE", "DATA_TYPE", "TYPE_PRECISION", "IS_IDENTITY",
-		"IS_PRIMARY_KEY", "IS_COMPUTED", "IS_GENERATED_ALWAYS", "IS_ROW_VERSION",
-		"HAS_DEFAULT", "PRIMARY_KEY_ORDINAL",
-	}
-	if c.emptyCatalog {
-		return &fakeRows{
-			columns: columns,
-			values:  [][]driver.Value{{"MainDB", "16.0.1000.6", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil}},
-		}, nil
-	}
-
-	values := [][]driver.Value{
-		catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "FW_ID", 1, false, "uniqueidentifier", true, true, false, false, false, false, 1),
-		catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "Total", 2, true, "[moneytypes].[Amount]", false, false, false, false, false, true, 0),
-		catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "Stamp", 3, false, "timestamp", false, false, false, false, true, false, 0),
-		catalogRow("MainDB", "dbo", "Vehicle", "BASE TABLE", "PeriodStart", 4, false, "datetime2", false, false, false, true, false, false, 0),
-		catalogRow("MainDB", "audit", "Vehicle", "VIEW", "FW_ID", 1, false, "int", false, false, true, false, false, false, 0),
-	}
-	if c.oldVersion {
-		for _, row := range values {
-			row[1] = "12.0.6024.0"
-		}
-	}
-	if c.inconsistentVersion {
-		values[len(values)-1][1] = "15.0.2000.5"
-	}
-	if c.externalTable {
-		values = append(values, catalogRow("MainDB", "ext", "RemoteData", "EXTERNAL TABLE", "ID", 1, false, "int", false, false, false, false, false, false, 0))
-	}
-	if c.inconsistentDatabase {
-		values[len(values)-1][0] = "OtherDB"
-		values[len(values)-1][2] = "OtherDB"
-	}
-	if c.mismatchedCatalog {
-		values[0][2] = "OtherDB"
-	}
-	return &fakeRows{columns: columns, values: values, iterationError: c.iterationError}, nil
-}
-
 func catalogRow(
 	databaseName, schema, table, tableType, column string,
 	ordinal int64,
@@ -503,27 +272,21 @@ func catalogRow(
 	}
 }
 
-type fakeRows struct {
-	columns        []string
-	values         [][]driver.Value
-	index          int
-	iterationError error
-}
-
-func (r *fakeRows) Columns() []string { return r.columns }
-
-func (r *fakeRows) Close() error { return nil }
-
-func (r *fakeRows) Next(destination []driver.Value) error {
-	if r.index < len(r.values) {
-		copy(destination, r.values[r.index])
-		r.index++
-		return nil
+func TestInspectRejectsIncompletePrimaryKey(t *testing.T) {
+	for _, hidden := range []bool{false, true} {
+		t.Run(fmt.Sprintf("entire_key_hidden=%v", hidden), func(t *testing.T) {
+			row := []driver.Value{"MainDB", "16.0.1000.6", "MainDB", "dbo", "Vehicle", "BASE TABLE", "ID", int64(1), false, "int", int64(10), false, true, false, false, false, false, int64(1)}
+			if hidden {
+				row[12] = false
+				row[len(row)-1] = int64(0)
+			}
+			response := sqlserverResponse([][]driver.Value{row})
+			response.Rows[0][len(row)] = int64(2)
+			registeredFakeDriver.SetResponse(response)
+			inspection, err := (&Backend{driverName: fakeDriverName}).Inspect(context.Background(), "dsn")
+			if inspection != nil || err == nil || !strings.Contains(err.Error(), "incomplete primary key metadata") {
+				t.Fatalf("Inspect = %#v, %v; want incomplete-key error", inspection, err)
+			}
+		})
 	}
-	if r.iterationError != nil {
-		err := r.iterationError
-		r.iterationError = nil
-		return err
-	}
-	return io.EOF
 }

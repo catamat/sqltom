@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -87,12 +88,13 @@ func TestInspectRejectsInvalidMySQLCatalogResults(t *testing.T) {
 }
 
 func mysqlResponse(rows [][]driver.Value) testdb.Response {
+	rows = testdb.WithPrimaryKeyCounts(rows)
 	return testdb.Response{
 		ExpectedQuery: catalogQuery,
 		Columns: []string{
 			"database_name", "server_version", "table_catalog", "table_schema", "table_name", "table_type",
 			"column_name", "ordinal_position", "is_nullable", "data_type", "column_type", "is_identity",
-			"is_primary_key", "is_computed", "is_generated_always", "has_default", "primary_key_ordinal",
+			"is_primary_key", "is_computed", "is_generated_always", "has_default", "primary_key_ordinal", "primary_key_count",
 		},
 		Rows: rows,
 	}
@@ -157,5 +159,24 @@ func TestCatalogQueryCapturesMySQLMetadata(t *testing.T) {
 	}
 	if strings.Contains(catalogQuery, "LOCATE('generated', LOWER(column_info.extra))") {
 		t.Error("catalogQuery treats DEFAULT_GENERATED as a computed column")
+	}
+}
+
+func TestInspectRejectsIncompletePrimaryKey(t *testing.T) {
+	for _, hidden := range []bool{false, true} {
+		t.Run(fmt.Sprintf("entire_key_hidden=%v", hidden), func(t *testing.T) {
+			row := mysqlCatalogRow("MainDB", "MainDB", "Vehicle", "BASE TABLE", "ID", 1, false, "int", "int", false, true, false, false, false, 1)
+			if hidden {
+				row[12] = false
+				row[len(row)-1] = int64(0)
+			}
+			response := mysqlResponse([][]driver.Value{row})
+			response.Rows[0][len(row)] = int64(2)
+			fakeMySQLDriver.SetResponse(response)
+			inspection, err := (&Backend{driverName: fakeMySQLDriverName}).Inspect(context.Background(), "dsn")
+			if inspection != nil || err == nil || !strings.Contains(err.Error(), "incomplete primary key metadata") {
+				t.Fatalf("Inspect = %#v, %v; want incomplete-key error", inspection, err)
+			}
+		})
 	}
 }

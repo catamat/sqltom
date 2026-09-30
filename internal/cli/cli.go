@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"runtime/debug"
+	"strconv"
 	"strings"
 
 	"github.com/catamat/sqltom/internal/dialect"
@@ -81,7 +82,7 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, service 
 		return ExitSuccess
 	}
 	if err != nil {
-		printError(stderr, "", err)
+		printError(stderr, "", err, sensitiveArguments(args)...)
 		return ExitUsage
 	}
 	if configuration.version {
@@ -148,6 +149,7 @@ func printError(output io.Writer, operation string, err error, sensitiveValues .
 func redactSensitive(message string, values ...string) string {
 	for _, value := range values {
 		if value != "" {
+			message = strings.ReplaceAll(message, strconv.Quote(value), `"<redacted>"`)
 			message = strings.ReplaceAll(message, value, "<redacted>")
 		}
 		trimmed := strings.TrimSpace(value)
@@ -156,6 +158,22 @@ func redactSensitive(message string, values ...string) string {
 		}
 	}
 	return message
+}
+
+// Extract DSNs even when flag parsing stops early (for example after a
+// positional argument). Never rely on a partially parsed configuration here.
+func sensitiveArguments(args []string) []string {
+	var values []string
+	for index, arg := range args {
+		flagName := strings.TrimPrefix(arg, "-")
+		flagName = strings.TrimPrefix(flagName, "-")
+		if flagName == "dsn" && index+1 < len(args) {
+			values = append(values, args[index+1])
+		} else if strings.HasPrefix(flagName, "dsn=") {
+			values = append(values, strings.TrimPrefix(flagName, "dsn="))
+		}
+	}
+	return values
 }
 
 func printWarnings(output io.Writer, warnings []string) {
@@ -215,7 +233,7 @@ func parse(args []string, stderr io.Writer) (options, error) {
 		return options{}, err
 	}
 	if flags.NArg() != 0 {
-		return options{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
+		return options{}, fmt.Errorf("unexpected positional arguments; use -inspect, -render, -generate, or -version")
 	}
 	tables, err := parseTables(tableList.value, tableList.set)
 	if err != nil {

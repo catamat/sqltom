@@ -2,7 +2,6 @@ package sqlserver
 
 import (
 	"context"
-	"embed"
 	"strconv"
 	"strings"
 
@@ -10,16 +9,16 @@ import (
 	commonrender "github.com/catamat/sqltom/internal/render"
 )
 
-//go:embed sqlserver.go.tpl
-var templateFiles embed.FS
-
 func (*Backend) Render(ctx context.Context, m *manifest.Manifest, outputFolder string) error {
 	return commonrender.Render(ctx, m, outputFolder, commonrender.Config{
 		Dialect:            "SQL Server",
-		TemplateFS:         templateFiles,
-		TemplateName:       "sqlserver.go.tpl",
 		SQLIdentifier:      sqlIdentifierSource,
 		SQLTableIdentifier: sqlTableIdentifierSource,
+		Placeholder:        func(index int) string { return "@p" + strconv.Itoa(index) },
+		InsertStrategy:     commonrender.InsertScopeIdentity,
+		EmptyInsert:        "DEFAULT VALUES",
+		ScanSQLServerUUID:  true,
+		TypedBinaryNulls:   true,
 	})
 }
 

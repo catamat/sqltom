@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -120,8 +121,8 @@ func ValidateForRender(m *Manifest) error {
 			}
 			fieldNames[goName] = column.ColumnName
 			jsonName := EffectiveJSONName(column)
-			if strings.Contains(jsonName, ",") {
-				return fmt.Errorf("table %q column %q JSONName %q contains a comma", table.Key(), column.ColumnName, jsonName)
+			if jsonName != "-" && !validJSONTagName(jsonName) {
+				return fmt.Errorf("table %q column %q JSONName %q is not a valid encoding/json field name", table.Key(), column.ColumnName, jsonName)
 			}
 			if jsonName != "-" {
 				if previous, exists := jsonNames[jsonName]; exists {
@@ -157,6 +158,20 @@ func ValidateForRender(m *Manifest) error {
 		}
 	}
 	return nil
+}
+
+func validJSONTagName(name string) bool {
+	if name == "" {
+		return false
+	}
+	const punctuation = "!#$%&()*+-./:;<=>?@[]^_{|}~ "
+	for _, character := range name {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) || strings.ContainsRune(punctuation, character) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validateColumns(location string, columns []Column) error {

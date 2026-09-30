@@ -73,6 +73,21 @@ func TestValidateForRenderAllowsRepeatedIgnoredJSONNames(t *testing.T) {
 	}
 }
 
+func TestValidateForRenderRejectsJSONNamesIgnoredByEncodingJSON(t *testing.T) {
+	for _, name := range []string{"", "quoted\"name", `back\\slash`, "line\nbreak", "comma,name"} {
+		t.Run(name, func(t *testing.T) {
+			m := validManifest()
+			m.Tables[0].Columns[0].JSONName = name
+			if name == "" {
+				m.Tables[0].Columns[0].ColumnName = "quoted\"name"
+			}
+			if err := ValidateForRender(m); err == nil || !strings.Contains(err.Error(), "valid encoding/json field name") {
+				t.Fatalf("ValidateForRender() = %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateStructureRejectsNegativePrimaryKeyOrdinal(t *testing.T) {
 	m := validManifest()
 	m.Tables[0].Columns[0].IsPrimaryKey = false
@@ -149,7 +164,7 @@ func TestMergeUsesFullTableIdentityAndPreservesOnlyOverrides(t *testing.T) {
 		TableType:    "VIEW",
 		IsManaged:    true,
 		Columns: []Column{{
-			ColumnName:      "FW_ID",
+			ColumnName:      "RecordID",
 			OrdinalPosition: 1,
 			DataType:        DataTypeInteger,
 		}},
@@ -200,7 +215,7 @@ func TestCanonicalizeKeepsColumnNamingOverridesLocal(t *testing.T) {
 		TableType:    "VIEW",
 		IsManaged:    true,
 		Columns: []Column{{
-			ColumnName:      "FW_ID",
+			ColumnName:      "RecordID",
 			OrdinalPosition: 1,
 			DataType:        DataTypeInteger,
 		}},
@@ -475,7 +490,7 @@ func validManifest() *Manifest {
 			TableType:    "BASE TABLE",
 			IsManaged:    true,
 			Columns: []Column{{
-				ColumnName:        "FW_ID",
+				ColumnName:        "RecordID",
 				OrdinalPosition:   1,
 				DataType:          DataTypeInteger,
 				IsPrimaryKey:      true,

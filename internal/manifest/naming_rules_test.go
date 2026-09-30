@@ -189,7 +189,7 @@ func TestReservedPackageAndTableNames(t *testing.T) {
 
 func TestValidateForRenderHasNoBackendGeneratedNameOrImportAssumptions(t *testing.T) {
 	m := validManifest()
-	m.Tables[0].GoName = "Select"
+	m.Tables[0].GoName = "SelectAll"
 	m.Tables[0].Columns[0].GoName = "Insert"
 	m.Tables[0].Columns[0].GoType = "sql.Value"
 	m.Tables[0].Columns[0].GoImport = "example.com/sql"

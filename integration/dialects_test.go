@@ -5,17 +5,11 @@ package integration_test
 import (
 	"context"
 	"database/sql"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/catamat/sqltom/internal/cli"
 	"github.com/catamat/sqltom/internal/dialect"
 	"github.com/catamat/sqltom/internal/dialect/mysql"
 	"github.com/catamat/sqltom/internal/dialect/postgres"
@@ -32,41 +26,34 @@ type fixture struct {
 	backend    dialect.Backend
 	schema     string
 	setup      []string
-	returnsID  bool
-	selectRow  string
 }
 
 func TestAllDialectsUseTheSameInspectionAndRenderingContract(t *testing.T) {
+	binary := buildCLI(t)
 	for _, current := range integrationFixtures(t) {
 		t.Run(current.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if current.dsn == "" {
+				t.Skip("external database DSN is not configured")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-
 			if current.name == dialect.SQLServer {
 				prepareSQLServerDatabase(t, ctx, current.adminDSN)
 			}
 			prepareSchema(t, ctx, current)
-
 			directory := t.TempDir()
-			runner := cli.NewWithDependencies(cli.Dependencies{
-				WorkingDirectory: directory,
-				Backends:         map[string]dialect.Backend{current.name: current.backend},
-			})
-			result, err := runner.Generate(ctx, current.name, current.dsn, filepath.Join(directory, "models"), nil)
-			if err != nil {
-				t.Fatalf("Generate() error = %v", err)
-			}
-
-			document, err := manifest.Load(result.ManifestFilename)
+			selected := []string{"Vehicle", "VehicleView", "CompositeKey"}
+			filename := generateModels(t, ctx, binary, directory, current, selected)
+			document, err := manifest.Load(filename)
 			if err != nil {
 				t.Fatal(err)
 			}
 			assertCommonManifest(t, document, current)
-			modelFilename := filepath.Join(directory, "models", "Vehicle", "Vehicle.go")
-			assertCommonRenderedWrites(t, modelFilename)
-			executeCommonRenderedWrites(t, ctx, current, modelFilename)
+			runGeneratedModels(t, ctx, binary, directory, current, selected)
+			t.Run("column_permissions", func(t *testing.T) { assertColumnPermissions(t, ctx, current) })
 			if current.name == dialect.Postgres {
 				assertPostgresDomainDefault(t, ctx, current)
+				assertPostgresReadOnlyKeys(t, ctx, current)
 			}
 		})
 	}
@@ -101,8 +88,6 @@ func integrationFixtures(t *testing.T) []fixture {
 			adminDSN:   requiredDSN("SQLTOM_SQLSERVER_ADMIN_DSN"),
 			backend:    sqlserver.New(),
 			schema:     "dbo",
-			returnsID:  true,
-			selectRow:  `SELECT [Name], [Defaulted], [Slug], [Notes] FROM [dbo].[Vehicle] WHERE [ID] = @p1`,
 			setup: []string{
 				`IF OBJECT_ID(N'dbo.VehicleView', N'V') IS NOT NULL DROP VIEW dbo.VehicleView`,
 				`IF OBJECT_ID(N'dbo.Vehicle', N'U') IS NOT NULL DROP TABLE dbo.Vehicle`,
@@ -114,13 +99,14 @@ func integrationFixtures(t *testing.T) []fixture {
 					[Slug] AS LOWER([Name]) PERSISTED,
 					[Notes] nvarchar(100) NULL
 				)`,
+				`CREATE TRIGGER dbo.VehicleInsertTrigger ON dbo.Vehicle AFTER INSERT AS BEGIN SET NOCOUNT ON; END`,
 				`CREATE VIEW dbo.VehicleView AS
 				 SELECT [Name], [ID], [Defaulted], [Slug], [Notes] FROM dbo.Vehicle`,
 				`CREATE TABLE dbo.CompositeKey (
 					[TenantID] int NOT NULL,
 					[ItemID] int NOT NULL,
 					[Payload] nvarchar(100) NULL,
-					CONSTRAINT PK_CompositeKey PRIMARY KEY ([TenantID], [ItemID])
+					CONSTRAINT PK_CompositeKey PRIMARY KEY ([ItemID], [TenantID])
 				)`,
 			},
 		},
@@ -130,8 +116,6 @@ func integrationFixtures(t *testing.T) []fixture {
 			dsn:        requiredDSN("SQLTOM_POSTGRES_DSN"),
 			backend:    postgres.New(),
 			schema:     "public",
-			returnsID:  true,
-			selectRow:  `SELECT "Name", "Defaulted", "Slug", "Notes" FROM "public"."Vehicle" WHERE "ID" = $1`,
 			setup: []string{
 				`DROP VIEW IF EXISTS "VehicleView"`,
 				`DROP TABLE IF EXISTS "Vehicle"`,
@@ -149,17 +133,17 @@ func integrationFixtures(t *testing.T) []fixture {
 					"TenantID" integer NOT NULL,
 					"ItemID" integer NOT NULL,
 					"Payload" text,
-					PRIMARY KEY ("TenantID", "ItemID")
+					PRIMARY KEY ("ItemID", "TenantID") INCLUDE ("Payload")
 				)`,
 			},
 		},
 		{
 			name:       dialect.MySQL,
 			driverName: dialect.MySQL,
+			adminDSN:   requiredDSN("SQLTOM_MYSQL_ADMIN_DSN"),
 			dsn:        requiredDSN("SQLTOM_MYSQL_DSN"),
 			backend:    mysql.New(),
 			schema:     "sqltom_test",
-			selectRow:  "SELECT Name, Defaulted, Slug, Notes FROM Vehicle WHERE ID = ?",
 			setup: []string{
 				"DROP VIEW IF EXISTS VehicleView",
 				"DROP TABLE IF EXISTS Vehicle",
@@ -177,7 +161,7 @@ func integrationFixtures(t *testing.T) []fixture {
 					TenantID integer NOT NULL,
 					ItemID integer NOT NULL,
 					Payload varchar(100),
-					PRIMARY KEY (TenantID, ItemID)
+					PRIMARY KEY (ItemID, TenantID)
 				)`,
 			},
 		},
@@ -187,7 +171,6 @@ func integrationFixtures(t *testing.T) []fixture {
 			dsn:        sqliteFilename,
 			backend:    sqlite.New(),
 			schema:     "main",
-			selectRow:  `SELECT "Name", "Defaulted", "Slug", "Notes" FROM "main"."Vehicle" WHERE "ID" = ?`,
 			setup: []string{
 				`DROP VIEW IF EXISTS VehicleView`,
 				`DROP TABLE IF EXISTS Vehicle`,
@@ -205,19 +188,13 @@ func integrationFixtures(t *testing.T) []fixture {
 					TenantID INTEGER NOT NULL,
 					ItemID INTEGER NOT NULL,
 					Payload TEXT,
-					PRIMARY KEY (TenantID, ItemID)
+					PRIMARY KEY (ItemID, TenantID)
 				)`,
 			},
 		},
 	}
 
-	available := fixtures[:0]
-	for _, current := range fixtures {
-		if current.dsn != "" {
-			available = append(available, current)
-		}
-	}
-	return available
+	return fixtures
 }
 
 func prepareSQLServerDatabase(t *testing.T, ctx context.Context, dsn string) {
@@ -237,11 +214,33 @@ func prepareSchema(t *testing.T, ctx context.Context, current fixture) {
 	db := openDatabase(t, ctx, current.driverName, current.dsn)
 	defer db.Close()
 	requireTestDatabase(t, ctx, db, current.name)
+	cleanupObjects(t, current, "TABLE", []string{"Vehicle", "CompositeKey"})
+	cleanupObjects(t, current, "VIEW", []string{"VehicleView"})
 	for _, statement := range current.setup {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("prepare %s schema with %q: %v", current.name, statement, err)
 		}
 	}
+}
+
+func cleanupObjects(t *testing.T, current fixture, kind string, names []string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		db, err := sql.Open(current.driverName, current.dsn)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer db.Close()
+		for _, name := range names {
+			query := "DROP " + kind + " IF EXISTS " + runtimeIdentifier(current, current.schema) + "." + runtimeIdentifier(current, name)
+			if _, err := db.ExecContext(ctx, query); err != nil {
+				t.Errorf("cleanup %s %s: %v", kind, name, err)
+			}
+		}
+	})
 }
 
 func requireTestDatabase(t *testing.T, ctx context.Context, db *sql.DB, dialectName string) {
@@ -324,8 +323,13 @@ func assertCommonManifest(t *testing.T, document *manifest.Manifest, current fix
 
 	for ordinal, name := range []string{"Name", "ID", "Defaulted", "Slug", "Notes"} {
 		column := findColumn(t, view, name)
+		// Views retain some source metadata in SQL Server and MySQL. PostgreSQL
+		// and SQLite conservatively describe all view columns as nullable.
+		wantIdentity := current.name == dialect.SQLServer && name == "ID"
+		wantDefault := current.name == dialect.MySQL && (name == "ID" || name == "Defaulted")
+		wantNullable := current.name == dialect.Postgres || current.name == dialect.SQLite || wantColumns[ordinal].IsNullable
 		if column.ColumnName != name || column.OrdinalPosition != ordinal+1 || column.DataType != wantColumns[ordinal].DataType ||
-			column.IsIdentity || column.IsPrimaryKey || column.IsComputed || column.IsGeneratedAlways || column.IsRowVersion || column.HasDefault || column.PrimaryKeyOrdinal != 0 {
+			column.IsNullable != wantNullable || column.IsIdentity != wantIdentity || column.IsPrimaryKey || column.IsComputed || column.IsGeneratedAlways || column.IsRowVersion || column.HasDefault != wantDefault || column.PrimaryKeyOrdinal != 0 {
 			t.Errorf("%s VehicleView.%s metadata = %#v", current.name, name, column)
 		}
 	}
@@ -336,8 +340,8 @@ func assertCommonManifest(t *testing.T, document *manifest.Manifest, current fix
 	}
 	assertTableIdentity(t, document, composite, current)
 	for _, want := range []manifest.Column{
-		{ColumnName: "TenantID", OrdinalPosition: 1, DataType: manifest.DataTypeInteger, IsPrimaryKey: true, PrimaryKeyOrdinal: 1},
-		{ColumnName: "ItemID", OrdinalPosition: 2, DataType: manifest.DataTypeInteger, IsPrimaryKey: true, PrimaryKeyOrdinal: 2},
+		{ColumnName: "TenantID", OrdinalPosition: 1, DataType: manifest.DataTypeInteger, IsPrimaryKey: true, PrimaryKeyOrdinal: 2},
+		{ColumnName: "ItemID", OrdinalPosition: 2, DataType: manifest.DataTypeInteger, IsPrimaryKey: true, PrimaryKeyOrdinal: 1},
 		{ColumnName: "Payload", OrdinalPosition: 3, IsNullable: true, DataType: manifest.DataTypeString},
 	} {
 		if got := findColumn(t, composite, want.ColumnName); got != want {
@@ -357,56 +361,6 @@ func assertTableIdentity(t *testing.T, document *manifest.Manifest, table manife
 	}
 }
 
-func assertCommonRenderedWrites(t *testing.T, filename string) {
-	t.Helper()
-	insert := generatedFunction(t, filename, "Insert")
-	update := generatedFunction(t, filename, "Update")
-	for _, field := range []string{"Name", "Defaulted", "Notes"} {
-		if !strings.Contains(insert, "r."+field) || !strings.Contains(update, "r."+field) {
-			t.Errorf("writable field %s is missing from Insert or Update", field)
-		}
-	}
-	if strings.Contains(insert, "Slug") || strings.Contains(update, "Slug") {
-		t.Error("computed field Slug is present in Insert or Update")
-	}
-}
-
-func executeCommonRenderedWrites(t *testing.T, ctx context.Context, current fixture, filename string) {
-	t.Helper()
-	insertQuery := generatedQuery(t, filename, "Insert")
-	updateQuery := generatedQuery(t, filename, "Update")
-	db := openDatabase(t, ctx, current.driverName, current.dsn)
-	defer db.Close()
-
-	var id int64
-	if current.returnsID {
-		if err := db.QueryRowContext(ctx, insertQuery, "Initial", "explicit", "notes").Scan(&id); err != nil {
-			t.Fatalf("%s generated insert: %v\n%s", current.name, err, insertQuery)
-		}
-	} else {
-		result, err := db.ExecContext(ctx, insertQuery, "Initial", "explicit", "notes")
-		if err != nil {
-			t.Fatalf("%s generated insert: %v\n%s", current.name, err, insertQuery)
-		}
-		id, err = result.LastInsertId()
-		if err != nil {
-			t.Fatalf("%s LastInsertId: %v", current.name, err)
-		}
-	}
-
-	if _, err := db.ExecContext(ctx, updateQuery, "Updated", "changed", "updated notes", id); err != nil {
-		t.Fatalf("%s generated update: %v\n%s", current.name, err, updateQuery)
-	}
-
-	var name, defaulted, slug, notes string
-	if err := db.QueryRowContext(ctx, current.selectRow, id).Scan(&name, &defaulted, &slug, &notes); err != nil {
-		t.Fatalf("%s verify generated writes: %v", current.name, err)
-	}
-	if name != "Updated" || defaulted != "changed" || slug != "updated" || notes != "updated notes" {
-		t.Fatalf("%s written row = (%q, %q, %q, %q)", current.name, name, defaulted, slug, notes)
-	}
-}
-
 func assertPostgresDomainDefault(t *testing.T, ctx context.Context, current fixture) {
 	t.Helper()
 	db := openDatabase(t, ctx, current.driverName, current.dsn)
@@ -423,6 +377,14 @@ func assertPostgresDomainDefault(t *testing.T, ctx context.Context, current fixt
 			t.Fatalf("prepare PostgreSQL domain default with %q: %v", statement, err)
 		}
 	}
+
+	defer func() {
+		for _, statement := range []string{`DROP TABLE "DomainDefault"`, `DROP DOMAIN "TextWithDefault"`} {
+			if _, err := db.ExecContext(ctx, statement); err != nil {
+				t.Errorf("domain cleanup: %v", err)
+			}
+		}
+	}()
 
 	inspection, err := current.backend.Inspect(ctx, current.dsn)
 	if err != nil {
@@ -455,91 +417,4 @@ func findColumn(t *testing.T, table manifest.Table, name string) manifest.Column
 	}
 	t.Fatalf("column %s.%s not found", table.TableName, name)
 	return manifest.Column{}
-}
-
-func generatedFunction(t *testing.T, filename, name string) string {
-	t.Helper()
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		t.Fatal(err)
-	}
-	files := token.NewFileSet()
-	file, err := parser.ParseFile(files, filename, data, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse %s: %v", filename, err)
-	}
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Name.Name != name {
-			continue
-		}
-		start := files.Position(function.Pos()).Offset
-		end := files.Position(function.End()).Offset
-		return string(data[start:end])
-	}
-	t.Fatalf("generated function %s not found in %s", name, filename)
-	return ""
-}
-
-func generatedQuery(t *testing.T, filename, functionName string) string {
-	t.Helper()
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		t.Fatal(err)
-	}
-	files := token.NewFileSet()
-	file, err := parser.ParseFile(files, filename, data, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse %s: %v", filename, err)
-	}
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Name.Name != functionName {
-			continue
-		}
-		var query string
-		var found bool
-		ast.Inspect(function.Body, func(node ast.Node) bool {
-			specification, ok := node.(*ast.ValueSpec)
-			if !ok {
-				return true
-			}
-			for index, name := range specification.Names {
-				if name.Name != "query" || index >= len(specification.Values) {
-					continue
-				}
-				query, found = constantString(specification.Values[index])
-				return false
-			}
-			return true
-		})
-		if !found {
-			t.Fatalf("constant query not found in generated function %s", functionName)
-		}
-		return query
-	}
-	t.Fatalf("generated function %s not found in %s", functionName, filename)
-	return ""
-}
-
-func constantString(expression ast.Expr) (string, bool) {
-	switch value := expression.(type) {
-	case *ast.BasicLit:
-		if value.Kind != token.STRING {
-			return "", false
-		}
-		unquoted, err := strconv.Unquote(value.Value)
-		return unquoted, err == nil
-	case *ast.BinaryExpr:
-		if value.Op != token.ADD {
-			return "", false
-		}
-		left, leftOK := constantString(value.X)
-		right, rightOK := constantString(value.Y)
-		return left + right, leftOK && rightOK
-	case *ast.ParenExpr:
-		return constantString(value.X)
-	default:
-		return "", false
-	}
 }

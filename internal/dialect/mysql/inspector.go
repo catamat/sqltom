@@ -29,7 +29,8 @@ SELECT
     catalog_info.is_computed,
     catalog_info.is_generated_always,
     catalog_info.has_default,
-    catalog_info.primary_key_ordinal
+    catalog_info.primary_key_ordinal,
+    catalog_info.primary_key_count
 FROM (
     SELECT COALESCE(DATABASE(), '') AS database_name, VERSION() AS server_version
 ) AS database_info
@@ -52,7 +53,14 @@ LEFT JOIN (
             column_info.column_default IS NOT NULL
             OR LOCATE('default_generated', LOWER(column_info.extra)) > 0
         ) AS has_default,
-        COALESCE(primary_key.ordinal_position, 0) AS primary_key_ordinal
+        COALESCE(primary_key.ordinal_position, 0) AS primary_key_ordinal,
+        (
+            SELECT COUNT(*)
+            FROM information_schema.statistics AS index_info
+            WHERE index_info.table_schema = column_info.table_schema
+                AND index_info.table_name = column_info.table_name
+                AND index_info.index_name = 'PRIMARY'
+        ) AS primary_key_count
     FROM information_schema.tables AS table_info
     INNER JOIN information_schema.columns AS column_info
         ON column_info.table_catalog = table_info.table_catalog
@@ -112,11 +120,12 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 	var serverVersion string
 	databaseNameSeen := false
 	tables := map[manifest.TableKey]*manifest.Table{}
+	primaryKeys := dialect.PrimaryKeyCounts{}
 	for rows.Next() {
 		var rowDatabaseName, rowServerVersion string
 		var tableCatalog, tableSchema, tableName, tableType sql.NullString
 		var columnName, dataType, columnType sql.NullString
-		var ordinalPosition, primaryKeyOrdinal sql.NullInt64
+		var ordinalPosition, primaryKeyOrdinal, primaryKeyCount sql.NullInt64
 		var isNullable, isIdentity, isPrimaryKey sql.NullBool
 		var isComputed, isGeneratedAlways, hasDefault sql.NullBool
 		if err := rows.Scan(
@@ -137,6 +146,7 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 			&isGeneratedAlways,
 			&hasDefault,
 			&primaryKeyOrdinal,
+			&primaryKeyCount,
 		); err != nil {
 			return nil, fmt.Errorf("scan MySQL catalog: %w", err)
 		}
@@ -158,7 +168,7 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 			tableCatalog.Valid, tableSchema.Valid, tableName.Valid, tableType.Valid,
 			columnName.Valid, ordinalPosition.Valid, isNullable.Valid, dataType.Valid,
 			columnType.Valid, isIdentity.Valid, isPrimaryKey.Valid, isComputed.Valid,
-			isGeneratedAlways.Valid, hasDefault.Valid, primaryKeyOrdinal.Valid,
+			isGeneratedAlways.Valid, hasDefault.Valid, primaryKeyOrdinal.Valid, primaryKeyCount.Valid,
 		}
 		validCount := 0
 		for _, valid := range valuesValid {
@@ -178,6 +188,9 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 		}
 
 		key := manifest.TableKey{Catalog: tableCatalog.String, Schema: tableSchema.String, Name: tableName.String}
+		if err := primaryKeys.Observe(key, primaryKeyCount.Int64); err != nil {
+			return nil, fmt.Errorf("validate MySQL inspection: %w", err)
+		}
 		table, exists := tables[key]
 		if !exists {
 			table = &manifest.Table{
@@ -213,6 +226,9 @@ func inspectCatalog(ctx context.Context, queryer catalogQuerier) (*dialect.Inspe
 
 	result := make([]manifest.Table, 0, len(tables))
 	for _, table := range tables {
+		if err := primaryKeys.Validate(*table); err != nil {
+			return nil, fmt.Errorf("validate MySQL inspection: %w", err)
+		}
 		result = append(result, *table)
 	}
 	document := manifest.New(databaseName, result)

@@ -122,10 +122,19 @@ func exportedSurface(t *testing.T, filename string) string {
 	for _, declaration := range file.Decls {
 		switch node := declaration.(type) {
 		case *ast.GenDecl:
-			if node.Tok != token.TYPE {
+			if node.Tok != token.TYPE && node.Tok != token.VAR {
 				continue
 			}
 			for _, specification := range node.Specs {
+				if value, ok := specification.(*ast.ValueSpec); ok {
+					for _, name := range value.Names {
+						if name.IsExported() {
+							writeNode(t, &result, value)
+							break
+						}
+					}
+					continue
+				}
 				typeSpecification, ok := specification.(*ast.TypeSpec)
 				if !ok || !typeSpecification.Name.IsExported() {
 					continue
@@ -135,6 +144,15 @@ func exportedSurface(t *testing.T, filename string) string {
 		case *ast.FuncDecl:
 			if !node.Name.IsExported() {
 				continue
+			}
+			if node.Recv != nil {
+				receiver := node.Recv.List[0].Type
+				if pointer, ok := receiver.(*ast.StarExpr); ok {
+					receiver = pointer.X
+				}
+				if name, ok := receiver.(*ast.Ident); ok && !name.IsExported() {
+					continue // Scanner/Valuer methods on private generated adapters.
+				}
 			}
 			copy := *node
 			copy.Doc = nil
@@ -183,10 +201,10 @@ func surfaceManifest() *manifest.Manifest {
 			GoName:       "Vehicle",
 			Columns: []manifest.Column{
 				{
-					ColumnName:        "FW_ID",
+					ColumnName:        "RecordID",
 					OrdinalPosition:   1,
 					DataType:          manifest.DataTypeUUID,
-					IsIdentity:        true,
+					IsIdentity:        false,
 					IsPrimaryKey:      true,
 					PrimaryKeyOrdinal: 1,
 					GoName:            "ID",

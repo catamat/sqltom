@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -92,8 +93,8 @@ func TestGenerateSavesMergedManifestThenRendersIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Tables) != 1 || loaded.Tables[0].TableName != "Vehicle" || loaded.Tables[0].GoName != backend.m.Tables[0].GoName {
-		t.Fatal("backend did not receive the persisted manifest")
+	if len(loaded.Tables) != 2 || loaded.Tables[0].TableName != "Vehicle" || loaded.Tables[0].GoName != backend.m.Tables[0].GoName {
+		t.Fatal("selected backend model does not match its persisted table")
 	}
 }
 
@@ -150,7 +151,7 @@ func TestGeneratePersistsUnmanagedStubsAndRendersOnlyManagedTables(t *testing.T)
 	}
 }
 
-func TestInspectPersistsOnlySelectedTablesAndPreservesOverrides(t *testing.T) {
+func TestInspectPreservesUnselectedTablesAndSelectedOverrides(t *testing.T) {
 	directory := t.TempDir()
 	previous := serviceManifest()
 	addServiceTable(previous, "dbo", "Widget", "BASE TABLE")
@@ -176,11 +177,93 @@ func TestInspectPersistsOnlySelectedTablesAndPreservesOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Tables) != 1 || loaded.Tables[0].TableName != "Vehicle" || loaded.Tables[0].GoName != "VehicleModel" {
+	if len(loaded.Tables) != 2 || loaded.Tables[0].TableName != "Vehicle" || loaded.Tables[0].GoName != "VehicleModel" {
 		t.Fatalf("filtered manifest tables = %#v", loaded.Tables)
 	}
 	if loaded.TypeMappings["integer"].GoType != "int64" {
 		t.Fatalf("filtered manifest mappings = %#v", loaded.TypeMappings)
+	}
+}
+
+func TestFilteredInspectionPreservesConfigurationAcrossFullRefresh(t *testing.T) {
+	directory := t.TempDir()
+	filename := filepath.Join(directory, "sqltom_MainDB.json")
+	previous := serviceManifest()
+	addServiceTable(previous, "dbo", "Widget", "BASE TABLE")
+	previous.Tables[1].GoName = "CustomWidget"
+	previous.Tables[1].Columns[0].GoName = "CustomID"
+	previous.Tables[1].Columns[0].GoType = "int64"
+	addServiceTable(previous, "dbo", "Disabled", "BASE TABLE")
+	previous.Tables[0].IsManaged = false
+	if err := manifest.SaveAtomic(filename, previous); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := manifest.Load(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeBackend{}
+	service := NewWithDependencies(Dependencies{WorkingDirectory: directory, Backends: map[string]dialect.Backend{dialect.SQLServer: backend}})
+	refresh := func(selection []string, includeWidget bool) OperationResult {
+		t.Helper()
+		fresh := serviceManifest()
+		addServiceTable(fresh, "dbo", "Disabled", "BASE TABLE")
+		if includeWidget {
+			addServiceTable(fresh, "dbo", "Widget", "BASE TABLE")
+		}
+		for ti := range fresh.Tables {
+			fresh.Tables[ti].Columns[0].IsNullable = true
+		}
+		backend.inspection = &dialect.Inspection{DatabaseName: "MainDB", Manifest: fresh}
+		result, err := service.Generate(context.Background(), dialect.SQLServer, "dsn", "models", selection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	result := refresh([]string{"dbo.Vehicle"}, true)
+	if result.Statistics.Tables != 1 || result.Statistics.ManagedTables != 1 || len(backend.m.Tables) != 1 || backend.m.Tables[0].TableName != "Vehicle" {
+		t.Fatalf("filtered operation = %#v, rendered tables = %#v", result, backend.m.Tables)
+	}
+	loaded, err := manifest.Load(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Tables) != 3 {
+		t.Fatalf("persisted tables = %d", len(loaded.Tables))
+	}
+	for _, index := range []int{0, 2} {
+		if !reflect.DeepEqual(loaded.Tables[index], previous.Tables[index]) {
+			t.Fatalf("unselected metadata or overrides changed: %#v", loaded.Tables[index])
+		}
+	}
+	refresh(nil, true)
+	loaded, err = manifest.Load(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Tables[0].IsManaged || len(loaded.Tables[0].Columns) != 0 {
+		t.Fatal("full refresh re-enabled an excluded table")
+	}
+	widget := loaded.Tables[2]
+	if widget.GoName != "CustomWidget" || widget.Columns[0].GoName != "CustomID" || widget.Columns[0].GoType != "int64" || !widget.Columns[0].IsNullable {
+		t.Fatalf("full refresh lost overrides or did not refresh metadata: %#v", widget)
+	}
+	refresh([]string{"Vehicle"}, false)
+	loaded, err = manifest.Load(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Tables) != 3 {
+		t.Fatal("partial refresh removed an unselected object")
+	}
+	refresh(nil, false)
+	loaded, err = manifest.Load(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Tables) != 2 {
+		t.Fatal("full refresh did not remove a dropped object")
 	}
 }
 
@@ -519,6 +602,10 @@ func TestFilteredRenderOutputContainsOnlySelectedModels(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(output, "Vehicle", "Vehicle.go")); err != nil {
 		t.Fatalf("current model is missing after output replacement: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(output, "query", "query.go")); err != nil {
+		t.Fatalf("support package missing from filtered render: %v", err)
+	}
+
 	loaded, err := manifest.Load(manifestFilename)
 	if err != nil {
 		t.Fatal(err)
@@ -572,10 +659,7 @@ func TestRenderFiltersBeforeBackendSpecificValidation(t *testing.T) {
 	m := serviceManifest()
 	broken := m.Tables[0]
 	broken.TableName = "Broken"
-	broken.Columns = append([]manifest.Column(nil), broken.Columns...)
-	broken.Columns[0].ColumnName = "ID"
-	broken.Columns[0].IsPrimaryKey = false
-	broken.Columns[0].PrimaryKeyOrdinal = 0
+	broken.GoName = "SelectAll"
 	m.Tables = append(m.Tables, broken)
 	if err := manifest.SaveAtomic(manifestFilename, m); err != nil {
 		t.Fatal(err)
@@ -708,7 +792,7 @@ func serviceManifest() *manifest.Manifest {
 		TableName:    "Vehicle",
 		TableType:    "BASE TABLE",
 		Columns: []manifest.Column{{
-			ColumnName:        "FW_ID",
+			ColumnName:        "RecordID",
 			OrdinalPosition:   1,
 			DataType:          "int",
 			IsPrimaryKey:      true,

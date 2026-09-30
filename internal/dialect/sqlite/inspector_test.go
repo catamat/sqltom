@@ -125,6 +125,9 @@ func TestInspectRejectsInvalidSQLiteCatalogResults(t *testing.T) {
 	objects := sqliteResponse(objectsQuery, []string{"schema", "name", "type", "ncol", "wr", "strict"}, [][]driver.Value{{"main", "Vehicle", "table", int64(1), int64(0), int64(0)}})
 	columnsQuery := `PRAGMA "main".table_xinfo('Vehicle')`
 	columns := sqliteResponse(columnsQuery, []string{"cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"}, [][]driver.Value{{int64(0), "ID", "INTEGER", int64(0), nil, int64(1), int64(0)}})
+	indexesQuery := `PRAGMA "main".index_list('Vehicle')`
+	indexes := sqliteResponse(indexesQuery, []string{"seq", "name", "unique", "origin", "partial"}, nil)
+	invalidIndexes := sqliteResponse(indexesQuery, indexes.Columns, [][]driver.Value{{"invalid", "pk", int64(1), "pk", int64(0)}})
 
 	tests := []struct {
 		name      string
@@ -140,6 +143,9 @@ func TestInspectRejectsInvalidSQLiteCatalogResults(t *testing.T) {
 		{name: "object iteration error", responses: []testdb.Response{version, databases, withSQLiteIterationError(objects, errors.New("iteration failed"))}, message: "iterate SQLite objects"},
 		{name: "column query error", responses: []testdb.Response{version, databases, objects, {ExpectedQuery: columnsQuery, QueryError: errors.New("query failed")}}, message: "query SQLite columns"},
 		{name: "column iteration error", responses: []testdb.Response{version, databases, objects, withSQLiteIterationError(columns, errors.New("iteration failed"))}, message: "iterate SQLite columns"},
+		{name: "index query error", responses: []testdb.Response{version, databases, objects, columns, {ExpectedQuery: indexesQuery, QueryError: errors.New("query failed")}}, message: "query SQLite indexes"},
+		{name: "index scan error", responses: []testdb.Response{version, databases, objects, columns, invalidIndexes}, message: "scan SQLite index"},
+		{name: "index iteration error", responses: []testdb.Response{version, databases, objects, columns, withSQLiteIterationError(indexes, errors.New("iteration failed"))}, message: "iterate SQLite indexes"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -187,6 +193,43 @@ func TestSQLiteQuoting(t *testing.T) {
 	}
 	if got, want := quoteSQLiteString(`a'b`), `'a''b'`; got != want {
 		t.Fatalf("quoteSQLiteString() = %q, want %q", got, want)
+	}
+}
+
+func TestInspectDistinguishesRowIDAliasesFromIndexedPrimaryKeys(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "keys.db")
+	db, err := sql.Open("sqlite", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tests := []struct {
+		name, definition, suffix string
+		identity, nullable       bool
+	}{
+		{"Ordinary", "ID INTEGER PRIMARY KEY, Name TEXT", "", true, false},
+		{"DescendingColumn", "ID INTEGER PRIMARY KEY DESC, Name TEXT", "", false, true},
+		{"DescendingTable", "ID INTEGER, Name TEXT, PRIMARY KEY (ID DESC)", "", true, false},
+		{"IntegerAlias", "ID INT PRIMARY KEY, Name TEXT", "", false, true},
+		{"Composite", "ID INTEGER, Name TEXT, PRIMARY KEY (ID, Name)", "", false, true},
+		{"WithoutRowID", "ID INTEGER PRIMARY KEY, Name TEXT", " WITHOUT ROWID", false, false},
+		{"Strict", "ID INTEGER PRIMARY KEY, Name TEXT", " STRICT", true, false},
+		{"StrictDescending", "ID INTEGER PRIMARY KEY DESC, Name TEXT", " STRICT", false, false},
+	}
+	for _, test := range tests {
+		if _, err := db.Exec("CREATE TABLE " + quoteSQLiteIdentifier(test.name) + " (" + test.definition + ")" + test.suffix); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := New().Inspect(context.Background(), filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range tests {
+		column := findColumn(t, findTable(t, inspection.Manifest, "main", test.name), "ID")
+		if column.IsIdentity != test.identity || column.IsNullable != test.nullable || !column.IsPrimaryKey {
+			t.Errorf("%s primary key = %#v", test.name, column)
+		}
 	}
 }
 

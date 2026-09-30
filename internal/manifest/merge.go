@@ -68,3 +68,26 @@ func cloneMappings(source map[string]TypeMapping) map[string]TypeMapping {
 	}
 	return result
 }
+
+// MergeSelected refreshes a selected subset while preserving the configuration
+// and metadata of every previously known object outside that subset. A full
+// inspection should use Merge, which also removes objects absent from the catalog.
+func MergeSelected(fresh, previous *Manifest) (*Manifest, error) {
+	merged, err := Merge(fresh, previous)
+	if err != nil || previous == nil {
+		return merged, err
+	}
+	merged = cloneManifest(merged)
+	selected := make(map[TableKey]struct{}, len(merged.Tables))
+	for _, table := range merged.Tables {
+		selected[table.Key()] = struct{}{}
+	}
+	for _, table := range previous.Tables {
+		if _, refreshed := selected[table.Key()]; !refreshed {
+			table.Columns = append([]Column(nil), table.Columns...)
+			merged.Tables = append(merged.Tables, table)
+		}
+	}
+	Canonicalize(merged)
+	return merged, nil
+}

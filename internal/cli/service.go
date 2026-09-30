@@ -209,7 +209,11 @@ func (s *Runner) inspectAndSave(ctx context.Context, dialectName, dsn string, ta
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return savedInspection{}, fmt.Errorf("inspect existing manifest %q: %w", manifestFilename, err)
 	}
-	merged, err := manifest.Merge(inspection.Manifest, previous)
+	merge := manifest.Merge
+	if len(tables) != 0 {
+		merge = manifest.MergeSelected
+	}
+	merged, err := merge(inspection.Manifest, previous)
 	if err != nil {
 		return savedInspection{}, fmt.Errorf("merge manifest %q: %w", manifestFilename, err)
 	}
@@ -219,7 +223,21 @@ func (s *Runner) inspectAndSave(ctx context.Context, dialectName, dsn string, ta
 	if err := manifest.SaveAtomic(manifestFilename, merged); err != nil {
 		return savedInspection{}, fmt.Errorf("save manifest %q: %w", manifestFilename, err)
 	}
-	return savedInspection{filename: manifestFilename, document: merged, backend: backend}, nil
+	// The persisted manifest can contain unselected objects. Only the requested
+	// subset contributes to statistics and to Generate's render operation. Match
+	// by resolved identities, so preserved objects cannot make a selector ambiguous.
+	operation := *merged
+	operation.Tables = make([]manifest.Table, 0, len(selected.Tables))
+	selectedKeys := make(map[manifest.TableKey]struct{}, len(selected.Tables))
+	for _, table := range selected.Tables {
+		selectedKeys[table.Key()] = struct{}{}
+	}
+	for _, table := range merged.Tables {
+		if _, ok := selectedKeys[table.Key()]; ok {
+			operation.Tables = append(operation.Tables, table)
+		}
+	}
+	return savedInspection{filename: manifestFilename, document: &operation, backend: backend}, nil
 }
 
 func (s *Runner) backend(dialectName string) (dialect.Backend, error) {

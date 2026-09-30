@@ -64,4 +64,5 @@ services:
       SQLTOM_SQLSERVER_ADMIN_DSN: "sqlserver://sa:Sqltom_test_2026!@sqlserver:1433?database=master&encrypt=disable"
       SQLTOM_SQLSERVER_DSN: "sqlserver://sa:Sqltom_test_2026!@sqlserver:1433?database=sqltom_test&encrypt=disable"
       SQLTOM_POSTGRES_DSN: "postgres://sqltom:sqltom@postgres:5432/sqltom_test?sslmode=disable"
+      SQLTOM_MYSQL_ADMIN_DSN: "root:sqltom-root@tcp(mysql:3306)/sqltom_test?parseTime=true"
       SQLTOM_MYSQL_DSN: "sqltom:sqltom@tcp(mysql:3306)/sqltom_test?parseTime=true"

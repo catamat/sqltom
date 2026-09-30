@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"embed"
 	"strconv"
 	"strings"
 
@@ -10,16 +9,16 @@ import (
 	commonrender "github.com/catamat/sqltom/internal/render"
 )
 
-//go:embed sqlite.go.tpl
-var templateFiles embed.FS
-
 func (*Backend) Render(ctx context.Context, m *manifest.Manifest, outputFolder string) error {
 	return commonrender.Render(ctx, m, outputFolder, commonrender.Config{
-		Dialect:            "SQLite",
-		TemplateFS:         templateFiles,
-		TemplateName:       "sqlite.go.tpl",
-		SQLIdentifier:      sqlIdentifierSource,
-		SQLTableIdentifier: sqlTableIdentifierSource,
+		RejectNullUpdateKey: true,
+		ScanBinary:          true,
+		Dialect:             "SQLite",
+		SQLIdentifier:       sqlIdentifierSource,
+		SQLTableIdentifier:  sqlTableIdentifierSource,
+		Placeholder:         func(int) string { return "?" },
+		InsertStrategy:      commonrender.InsertExecLastInsertID,
+		EmptyInsert:         "DEFAULT VALUES",
 	})
 }
 

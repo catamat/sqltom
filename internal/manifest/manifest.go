@@ -114,6 +114,37 @@ func ResolveType(m *Manifest, column Column) (ResolvedType, error) {
 	return resolveMapping(mapping, column.IsNullable)
 }
 
+// WithTypeDefaults builds a rendering view with dialect-specific defaults.
+// Explicit column types and matching manifest mappings take precedence. The
+// original manifest and the supplied defaults are never modified or persisted.
+// Default keys use the canonical data type vocabulary.
+func WithTypeDefaults(m *Manifest, defaults map[string]TypeMapping) (*Manifest, error) {
+	if m == nil || len(defaults) == 0 {
+		return m, nil
+	}
+	result := *m
+	result.TypeMappings = cloneMappings(m.TypeMappings)
+	for _, table := range m.Tables {
+		for _, column := range table.Columns {
+			if strings.TrimSpace(column.GoType) != "" {
+				continue
+			}
+			_, explicit, err := customMapping(m.TypeMappings, column.DataType)
+			if err != nil {
+				return nil, fmt.Errorf("table %q column %q: %w", table.Key(), column.ColumnName, err)
+			}
+			if explicit {
+				continue
+			}
+			canonical, _ := CanonicalDataType(column.DataType)
+			if mapping, found := defaults[canonical]; found {
+				result.TypeMappings[strings.TrimSpace(column.DataType)] = mapping
+			}
+		}
+	}
+	return &result, nil
+}
+
 func resolveMapping(mapping TypeMapping, nullable bool) (ResolvedType, error) {
 	goType := strings.TrimSpace(mapping.GoType)
 	if goType == "" {

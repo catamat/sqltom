@@ -270,6 +270,9 @@ func inspectColumns(ctx context.Context, queryer catalogQuerier, object objectIn
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate SQLite columns for %q.%q: %w", object.schema, object.name, err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close SQLite columns for %q.%q: %w", object.schema, object.name, err)
+	}
 
 	primaryKeyIndex := -1
 	primaryKeyCount := 0
@@ -281,10 +284,40 @@ func inspectColumns(ctx context.Context, queryer catalogQuerier, object objectIn
 	}
 	if !object.withoutRowID && primaryKeyCount == 1 &&
 		strings.EqualFold(strings.TrimSpace(declaredTypes[primaryKeyIndex]), "INTEGER") {
-		columns[primaryKeyIndex].IsIdentity = true
-		columns[primaryKeyIndex].IsNullable = false
+		// An actual rowid alias has no separate primary-key index. In
+		// particular, INTEGER PRIMARY KEY DESC declared on the column does.
+		hasIndex, err := hasPrimaryKeyIndex(ctx, queryer, object)
+		if err != nil {
+			return nil, err
+		}
+		if !hasIndex {
+			columns[primaryKeyIndex].IsIdentity = true
+			columns[primaryKeyIndex].IsNullable = false
+		}
 	}
 	return columns, nil
+}
+
+func hasPrimaryKeyIndex(ctx context.Context, queryer catalogQuerier, object objectInfo) (bool, error) {
+	query := "PRAGMA " + quoteSQLiteIdentifier(object.schema) + ".index_list(" + quoteSQLiteString(object.name) + ")"
+	rows, err := queryer.QueryContext(ctx, query)
+	if err != nil {
+		return false, fmt.Errorf("query SQLite indexes for %q.%q: %w", object.schema, object.name, err)
+	}
+	defer rows.Close()
+	hasPrimary := false
+	for rows.Next() {
+		var sequence, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&sequence, &name, &unique, &origin, &partial); err != nil {
+			return false, fmt.Errorf("scan SQLite indexes for %q.%q: %w", object.schema, object.name, err)
+		}
+		hasPrimary = hasPrimary || origin == "pk"
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate SQLite indexes for %q.%q: %w", object.schema, object.name, err)
+	}
+	return hasPrimary, nil
 }
 
 func databaseNameFromFile(filename string) string {

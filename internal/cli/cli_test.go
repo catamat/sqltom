@@ -385,3 +385,23 @@ func TestMissingServiceIsClassifiedAsBlockingError(t *testing.T) {
 		t.Fatalf("missing service wrote success output: %q", stdout.String())
 	}
 }
+
+func TestUsageErrorsNeverEchoConnectionStrings(t *testing.T) {
+	secret := "postgres://audit:private-password@localhost/db"
+	for _, args := range [][]string{
+		{"inspect", "-dialect", "postgres", "-dsn", secret},
+		{"inspect", "--dsn=" + secret},
+		{"-inspect", "-dsn", secret, "extra", secret},
+		{"-inspect=" + secret, "-dsn", secret},
+		{"-inspect=" + secret + `"quoted`, "-dsn", secret + `"quoted`},
+	} {
+		var stdout, stderr bytes.Buffer
+		service := &fakeService{}
+		if code := Main(context.Background(), args, &stdout, &stderr, service); code != ExitUsage {
+			t.Fatalf("code = %d, want usage error", code)
+		}
+		if strings.Contains(stderr.String(), "private-password") || stdout.Len() != 0 || service.inspectCalls != 0 {
+			t.Fatalf("usage error leaked arguments or called service: %q", stderr.String())
+		}
+	}
+}

@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"embed"
 	"strconv"
 	"strings"
 
@@ -10,16 +9,14 @@ import (
 	commonrender "github.com/catamat/sqltom/internal/render"
 )
 
-//go:embed postgres.go.tpl
-var templateFiles embed.FS
-
 func (*Backend) Render(ctx context.Context, m *manifest.Manifest, outputFolder string) error {
 	return commonrender.Render(ctx, m, outputFolder, commonrender.Config{
 		Dialect:            "PostgreSQL",
-		TemplateFS:         templateFiles,
-		TemplateName:       "postgres.go.tpl",
 		SQLIdentifier:      sqlIdentifierSource,
 		SQLTableIdentifier: sqlTableIdentifierSource,
+		Placeholder:        func(index int) string { return "$" + strconv.Itoa(index) },
+		InsertStrategy:     commonrender.InsertQueryReturning,
+		EmptyInsert:        "DEFAULT VALUES",
 	})
 }
 
